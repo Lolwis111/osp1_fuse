@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 
 #include "md5.h"
 
@@ -15,6 +16,55 @@
 #include <fuse.h>
 
 #define DWRITE(str) {write(debugFD, str, strlen(str));write(debugFD, "\n", 1);}
+
+static void updateReferenceCount(const char* hash, int direction)
+{
+	FILE* file = fopen("/home/osp-user/.CONTAINER/count", "rw");
+
+	size_t length = 8;
+	int i = 0;
+	for (;;) 
+	{
+		char buffer[36];
+    	size_t n = fread(buffer, 1, 36, file);
+
+    	if (n < bufsize) 
+    	{ 
+    		break; 
+    	}
+    	else
+    	{
+    		if(strncmp(hash, buffer, 32) == 0)
+    		{
+    			int count = *(int*)(buffer + 32);
+
+    			count += direction;
+
+    			buffer[32] = (count >> 24) & 0xFF;
+				buffer[33] = (count >> 16) & 0xFF;
+				buffer[34] = (count >> 8) & 0xFF;
+				buffer[35] = count & 0xFF;
+
+				fseek(file, i * 36, SEEK_SET);
+				fwrite(buffer, 1, 36, file);
+
+				close(fd);
+
+				return count;
+    		}
+
+    		i++;
+    	}
+	}
+
+	fwrite(hash, 1, 32, file);
+	int c = 0;
+	fwrite(&c, 1, 4, file);
+
+	close(fd);
+
+	return 0;
+}
 
 static int debugFD;
 
@@ -47,31 +97,43 @@ static inline uint64_t hash(const void* key, size_t size)
 	return hash_cont(key, size, 0xcbf29ce484222325ull);
 }
 
-// static int md5hash(const char* filename, unsigned char* hash)
-// {
-// 	MD5_CTX ctx;
-// 	char buffer[512];
+static void copyFile(char* srcPath, char* destPath)
+{
+	pid_t id;
+	if((id = fork()) == 0)
+	{
+		execl("/bin/cp", "-pf", srcPath, destPath, (char *)0);
+	}
+	{
+		waitpid(id, NULL, 0);
+	}
+}
 
-// 	MD5_Init(&ctx);
+static int md5hash(const char* filename, unsigned char* hash)
+{
+	MD5_CTX ctx;
+	char buffer[512];
 
-// 	int fd = open(filename, O_RDONLY);
+	MD5_Init(&ctx);
 
-// 	if(fd == -1)
-// 		return -1;
+	int fd = open(filename, O_RDONLY);
 
-// 	ssize_t bytes = read(fd, buffer, 512);
-// 	while(bytes > 0)
-// 	{
-// 		MD5_Update(&ctx, buffer, bytes);
-// 		bytes = read(fd, buffer, 512);
-// 	}
+	if(fd == -1)
+		return -1;
 
-// 	MD5_Final(hash, &ctx);
+	ssize_t bytes = read(fd, buffer, 512);
+	while(bytes > 0)
+	{
+		MD5_Update(&ctx, buffer, bytes);
+		bytes = read(fd, buffer, 512);
+	}
 
-// 	close(fd);
+	MD5_Final(hash, &ctx);
 
-// 	return 0;
-// }
+	close(fd);
+
+	return 0;
+}
 
  /**@brief Used to create directories.
  */
@@ -100,26 +162,21 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 	cfg->attr_timeout = 0;
 	cfg->negative_timeout = 0;
 
-	// DWRITE("Creating /home/osp-user/.CONTAINER");
+	DWRITE("Creating /home/osp-user/.CONTAINER");
 
-	// mkdir("/home/osp-user/.CONTAINER", 0777);
+	mkdir("/home/osp-user/.CONTAINER", 0777);
 
 	return NULL;
 }
 
 /**@brief Used to retrieve file attributes.
  */
-// static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_info* fi)
-// {
-// 	int rc;
+static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_info* fi)
+{
+	int rc = lstat(path, stbuf);
 	
-// 	// if (fi != NULL)
-// 	// 	rc = fstat(fi->fh, stbuf);
-// 	// else
-// 		rc = lstat(path, stbuf);
-	
-// 	return (rc != 0) ? -errno : 0;
-// }
+	return (rc != 0) ? -errno : 0;
+}
 
 /**@brief Used to retrieve directory entries.
  */
@@ -176,59 +233,30 @@ static int dedupCreate(const char* path, mode_t mode,
  */
 static int dedupOpen(const char* path, struct fuse_file_info* fi)
 {
-	int fd;
-
 	DWRITE("OPEN");
 	DWRITE(path);
-	
-	int f = creat("/home/osp-user/.CONTAINER/1313", 0777);
 
-	if(f < 0) 
+	if(fi) 
 	{
-		DWRITE("1313 fail");
-		DWRITE(strerror(errno));
-	}
-	else
-	{ 
-		close(f);
+		if(fi->fh) 
+		{
+			close(fi->fh);
+		}
 	}
 
-	// fd = open(path, fi->flags);
-	fd = open(path, O_RDWR | O_CREAT, 0777);
+	int fd = open(path, O_CREAT | O_WRONLY, 0644);
 	
-	if (fd != 0)
+	if (fd < 0)
 	{
-		DWRITE(strerror(errno));
-		return -errno;
+		if(errno != EEXIST)
+		{
+			DWRITE(strerror(errno));
+			return -errno;
+		}
 	}
+
+	close(fd);
 	
-	fi->fh = fd;
-	return 0;
-}
-
-static int xmp_chmod(const char *path, mode_t mode,
-		     struct fuse_file_info *fi)
-{
-	(void) fi;
-	int res;
-
-	res = chmod(path, mode);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_chown(const char *path, uid_t uid, gid_t gid,
-		     struct fuse_file_info *fi)
-{
-	(void) fi;
-	int res;
-
-	res = lchown(path, uid, gid);
-	if (res == -1)
-		return -errno;
-
 	return 0;
 }
 
@@ -240,26 +268,31 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 	DWRITE("READ");
 	DWRITE(path);
 
-		int fd;
-	int res;
+	char hashBuf[33];
+	hashBuf[32] = 0x00;
 
-	if(fi == NULL)
-		fd = open(path, O_RDONLY);
-	else
-		fd = fi->fh;
+	int fd = open(path, O_RDONLY);
 	
-	if (fd == -1)
+	if (fd < 0)
 		return -errno;
 
-	res = pread(fd, buf, size, offset);
+	int res = pread(fd, hashBuf, 32, 0);
+
 	if (res == -1)
 		res = -errno;
 
-	if(fi == NULL)
-		close(fd);
-	return res;
+	close(fd);
 
-	// return (pread(fi->fh, buf, size, offset) != 0) ? -errno : 0;
+	char name[128];
+	snprintf(name, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
+
+	fd = open(name, O_RDONLY);
+
+	res = pread(fd, buf, size, offset);
+
+	close(fd);
+
+	return res;
 }
 
 /**@brief Used to write file contents.
@@ -270,55 +303,112 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	DWRITE("WRITE");
 	DWRITE(path);
 
-	int fd;
-	int res;
-
 	(void) fi;
-	if(fi == NULL)
-		fd = open(path, O_WRONLY);
-	else
-		fd = fi->fh;
+	int res = 0;
+	int fileFD = open(path, O_RDONLY);
 	
-	if (fd == -1)
-		return -errno;
+	if (fileFD < 0)
+		res = -errno;
 
-	res = pwrite(fd, buf, size, offset);
+	char hashBuf[33];
+	hashBuf[32] = 0x00;
+	res = pread(fileFD, hashBuf, 32, 0);
+
 	if (res == -1)
 		res = -errno;
 
-	if(fi == NULL)
-		close(fd);
+	close(fileFD);
+
+	char* oldName = calloc(128, sizeof(char));
+
+	if(res == 0)
+	{
+		strcpy(oldName, "/home/osp-user/.CONTAINER/temp");
+		int f = creat(oldName, 0644);
+		close(f);
+	}
+	else
+	{
+		snprintf(oldName, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
+		copyFile(oldName, "/home/osp-user/.CONTAINER/temp");
+		updateReferenceCount(hashBuf, -1);
+	}
+
+	int hashFD = open("/home/osp-user/.CONTAINER/temp", O_RDWR);
+
+	res = pwrite(hashFD, buf, size, offset);
+
+	if(res == -1)
+		res = -errno;
+
+	close(hashFD);
+
+	unsigned char *hash = calloc(32, sizeof(unsigned char));
+	md5hash("/home/osp-user/.CONTAINER/temp", hash);
+	char hashStr[33];
+	hashStr[32] = 0x00;
+	for(int i = 0; i < 16; i++)
+	{
+		if(hash[i] < 0x10)
+			snprintf(hashStr+(i * 2), 32, "0%x", hash[i]);
+		else
+			snprintf(hashStr+(i * 2), 32, "%x", hash[i]);
+	}
+
+	char newName[128];
+	snprintf(newName, 128, "/home/osp-user/.CONTAINER/%s", hashStr);
+
+	DWRITE(newName);
+
+	fileFD = open(path, O_WRONLY | O_TRUNC);
+
+	if(fileFD < 0)
+	{
+		res = -errno;
+	}
+
+	res = pwrite(fileFD, hashStr, 32, 0);
+
+	if(res == -1)
+		res = -errno;
+
+	close(fileFD);
+
+	rename("/home/osp-user/.CONTAINER/temp", newName);
+	updateReferenceCount(hashStr, 1);
+
+	free(oldName);
+
 	return res;
-
-	// unsigned char *hash = malloc(sizeof(unsigned char) * 33);
-	// hash[33] = 0x00;
-
-	// char hashPath[64];
-
-	// // TODO: rebuild hashes
-
-	// dedupCreate(path, 0777, fi);
-
-	// int fd = open(path, O_WRONLY);
-	// int error = (pwrite(fd, buf, size, offset) != 0) ? -errno : 0;
-
-	// md5hash(path, hash);	
-
-	// snprintf(hashPath, 64, "/home/osp-user/.CONTAINER/%s", hash);
-
-	// creat(hashPath, 0777);
-
-	// DWRITE(hashPath);
-
-	// free(hash);
-
-	// return error;
 }
 
 static int dedupUnlink(const char* path)
 {
 	DWRITE("UNLINK");
 	DWRITE(path);
+
+	char hashBuf[33];
+	hashBuf[32] = 0x00;
+
+	int fd = open(path, O_RDONLY);
+	
+	if (fd < 0)
+		return -errno;
+
+	int res = pread(fd, hashBuf, 32, 0);
+
+	if (res == -1)
+		res = -errno;
+
+	close(fd);
+
+	int count = updateReferenceCount(hashBuf, -1);
+
+	if(count == 0)
+	{
+		// delete from .container
+	}
+
 	return (unlink(path) != 0) ? -errno : 0;
 }
 
@@ -329,81 +419,11 @@ static int dedupRmdir(const char* path)
 	return (rmdir(path) != 0) ? -errno : 0;
 }
 
-/* from fuse passthrough example */
-static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
-{
-	int res;
-
-	/* On Linux this could just be 'mknod(path, mode, rdev)' but this
-	   is more portable */
-	if (S_ISREG(mode)) {
-		res = open(path, O_CREAT | O_EXCL | O_WRONLY, mode);
-		if (res >= 0)
-			res = close(res);
-	} else if (S_ISFIFO(mode))
-		res = mkfifo(path, mode);
-	else
-		res = mknod(path, mode, rdev);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
-{
-	(void) fi;
-	int res;
-
-	res = lstat(path, stbuf);
-
-	stbuf->st_uid = getuid();
-	stbuf->st_gid = getgid();
-	stbuf->st_atime = time( NULL );
-	stbuf->st_mtime = time( NULL );
-
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_access(const char *path, int mask)
-{
-	int res;
-
-	res = access(path, mask);
-	if (res == -1)
-		return -errno;
-
-	return 0;
-}
-
-static int xmp_readlink(const char *path, char *buf, size_t size)
-{
-	int res;
-
-	res = readlink(path, buf, size - 1);
-	if (res == -1)
-		return -errno;
-
-	buf[res] = '\0';
-	return 0;
-}
-
-static int xmp_release(const char *path, struct fuse_file_info *fi)
-{
-	(void) path;
-	close(fi->fh);
-	return 0;
-}
-
 /**@brief Maps the callback functions to FUSE operations.
  */
 static const struct fuse_operations dedupOper = {
 	.init           = dedupInit,
-	//.getattr        = dedupGetAttr,
-	.getattr        = xmp_getattr,
+	.getattr        = dedupGetAttr,
 	.readdir        = dedupReadDir,
 	.mkdir          = dedupMkdir,
 	.create         = dedupCreate,
@@ -412,12 +432,6 @@ static const struct fuse_operations dedupOper = {
 	.write          = dedupWrite,
 	.unlink			= dedupUnlink,
 	.rmdir 			= dedupRmdir,
-	.mknod = xmp_mknod,
-	.chmod = xmp_chmod,
-	.chown = xmp_chown,
-	.access = xmp_access,
-	.readlink = xmp_readlink,
-	.release = xmp_release
 };
 
 int main(int argc, char* argv[])
