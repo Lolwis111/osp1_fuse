@@ -9,6 +9,9 @@ OBJ = $(SRC:%.c=%.o)
 CFLAGS := -std=gnu11 -c -g -Os -Wall -Werror -Wno-unused-value -Wno-unused-result `pkg-config fuse3 --cflags`
 LFLAGS := `pkg-config fuse3 --libs` -Wl,-rpath="`pkg-config fuse3 --libs-only-L | cut -c 3-`"
 
+#CFLAGS := -std=gnu11 -c -g -Os -Wall -Werror -Wno-unused-value -Wno-unused-result `pkg-config osxfuse --cflags`
+#LFLAGS := `pkg-config osxfuse --libs` -Wl,-rpath="`pkg-config osxfuse --libs-only-L | cut -c 3-`"
+
 %.o: %.c %.h
 	$(CC) $< $(CFLAGS) -o $@
 
