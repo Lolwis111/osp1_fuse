@@ -17,34 +17,51 @@
 
 #define DWRITE(str) {write(debugFD, str, strlen(str));write(debugFD, "\n", 1);}
 
-static void updateReferenceCount(const char* hash, int direction)
+/*
+ * Adds the value of direction to the reference counter of the file
+ * with the given hash.
+ * This is required to track how many files refer to the same
+ * content.
+ */
+static void updateReferenceCount(const char* hash, int32_t direction)
 {
+	/* open the reference counter file.
+	 * The file is organized in blocks of 36 bytes.
+	 * Each 36 Byte block is made up of
+	 * 32 Bytes of MD5 ASCII String and 4 Bytes as a raw integer
+	 */
 	FILE* file = fopen("/home/osp-user/.CONTAINER/count", "rw");
 
-	size_t length = 8;
-	int i = 0;
-	for (;;) 
+	for (int i = 0;;) 
 	{
+		/* read 36 bytes */
 		char buffer[36];
     	size_t n = fread(buffer, 1, 36, file);
 
     	if (n < bufsize) 
     	{ 
+    		/* exit on eof */
     		break; 
     	}
     	else
     	{
+    		/* check if we found the correct hash */
     		if(strncmp(hash, buffer, 32) == 0)
     		{
-    			int count = *(int*)(buffer + 32);
+    			/* Interpret the last 4 bytes as an integer */
+    			int32_t count = *(int32_t*)(buffer + 32);
 
+    			/* update the value */
     			count += direction;
 
+    			/* Split the integer back into 4 bytes 
+    			 * (bit magic, check stackoverflow or something) */
     			buffer[32] = (count >> 24) & 0xFF;
 				buffer[33] = (count >> 16) & 0xFF;
 				buffer[34] = (count >> 8) & 0xFF;
 				buffer[35] = count & 0xFF;
 
+				/* write the 36 byte block back */
 				fseek(file, i * 36, SEEK_SET);
 				fwrite(buffer, 1, 36, file);
 
@@ -57,8 +74,9 @@ static void updateReferenceCount(const char* hash, int direction)
     	}
 	}
 
+	/* if no entry is found, just append it at the very end */
 	fwrite(hash, 1, 32, file);
-	int c = 0;
+	int32_t c = 0;
 	fwrite(&c, 1, 4, file);
 
 	close(fd);
@@ -68,37 +86,12 @@ static void updateReferenceCount(const char* hash, int direction)
 
 static int debugFD;
 
-/**@brief Calculates the hash value of a memory block relative to hash value of
- * the previous block.
- * @param key   pointer to the memory block
- * @param size  size of the memory block
- * @param hval  hash value of the previous memory block
+/**
+ * copy the file from srcPath to a file at destPath
  */
-static uint64_t hash_cont(const void* key, size_t size, uint64_t hval)
-{
-	const char* ptr = key;
-	
-	while (size --> 0)
-	{
-		hval ^= *ptr;
-		hval *= 0x100000001b3ull;
-		++ptr;
-	}
-	
-	return hval;
-}
-
-/**@brief Calculates the hash value of a first memory block.
- * @param key   pointer to the memory block
- * @param size  size of the memory block
- */
-static inline uint64_t hash(const void* key, size_t size)
-{
-	return hash_cont(key, size, 0xcbf29ce484222325ull);
-}
-
 static void copyFile(char* srcPath, char* destPath)
 {
+	/* Let the shell handle this, much easier */
 	pid_t id;
 	if((id = fork()) == 0)
 	{
@@ -109,18 +102,27 @@ static void copyFile(char* srcPath, char* destPath)
 	}
 }
 
+/**
+ * Calculate the md5 hash in hash of the file pointed to by
+ * filename (a path).
+ * Check md5.h and md5.c for legal information and licence
+ * and stuff.
+ */
 static int md5hash(const char* filename, unsigned char* hash)
 {
 	MD5_CTX ctx;
 	char buffer[512];
 
+	/* initalize the md5 process */
 	MD5_Init(&ctx);
 
+	/* open the file */
 	int fd = open(filename, O_RDONLY);
 
-	if(fd == -1)
-		return -1;
+	if(fd < 0)
+		return -errno;
 
+	/* md5 processes data in blocks of 512, so read 512 blocks */
 	ssize_t bytes = read(fd, buffer, 512);
 	while(bytes > 0)
 	{
@@ -128,6 +130,7 @@ static int md5hash(const char* filename, unsigned char* hash)
 		bytes = read(fd, buffer, 512);
 	}
 
+	/* finish it up */
 	MD5_Final(hash, &ctx);
 
 	close(fd);
@@ -163,7 +166,6 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 	cfg->negative_timeout = 0;
 
 	DWRITE("Creating /home/osp-user/.CONTAINER");
-
 	mkdir("/home/osp-user/.CONTAINER", 0777);
 
 	return NULL;
@@ -190,7 +192,9 @@ static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler,
 	struct dirent* entry;
 	
 	if ((dir = opendir(path)) == NULL)
+	{
 		return -errno;
+	}
 	
 	seekdir(dir, offset);
 	while ((entry = readdir(dir)) != NULL)
@@ -204,7 +208,9 @@ static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler,
 		st.st_gid = getgid();
 
 		if (filler(buf, entry->d_name, &st, 0, 0))
+		{
 			break;
+		}
 	}
 	
 	closedir(dir);
@@ -213,19 +219,20 @@ static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler,
 
 /**@brief Used to create files.
  */
-static int dedupCreate(const char* path, mode_t mode,
-                       struct fuse_file_info* fi)
+static int dedupCreate(const char* path, mode_t mode, struct fuse_file_info* fi)
 {
 	DWRITE("CREATE");
 	DWRITE(path);
 
-	int fd;
-	
-	fd = open(path, fi->flags, mode);
-	if (fd != 0)
+	int fd = open(path, fi->flags, mode);
+
+	if (fd < 0)
+	{
 		return -errno;
+	}
 	
-	fi->fh = fd;
+	close(fd);
+
 	return 0;
 }
 
@@ -274,12 +281,16 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 	int fd = open(path, O_RDONLY);
 	
 	if (fd < 0)
+	{
 		return -errno;
+	}
 
 	int res = pread(fd, hashBuf, 32, 0);
 
 	if (res == -1)
+	{
 		res = -errno;
+	}
 
 	close(fd);
 
@@ -287,6 +298,11 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 	snprintf(name, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 
 	fd = open(name, O_RDONLY);
+
+	if(fd < 0)
+	{
+		return -errno;
+	}
 
 	res = pread(fd, buf, size, offset);
 
@@ -308,14 +324,18 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	int fileFD = open(path, O_RDONLY);
 	
 	if (fileFD < 0)
+	{
 		res = -errno;
+	}
 
 	char hashBuf[33];
 	hashBuf[32] = 0x00;
 	res = pread(fileFD, hashBuf, 32, 0);
 
 	if (res == -1)
+	{
 		res = -errno;
+	}
 
 	close(fileFD);
 
@@ -339,7 +359,9 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	res = pwrite(hashFD, buf, size, offset);
 
 	if(res == -1)
+	{
 		res = -errno;
+	}
 
 	close(hashFD);
 
@@ -347,12 +369,20 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	md5hash("/home/osp-user/.CONTAINER/temp", hash);
 	char hashStr[33];
 	hashStr[32] = 0x00;
+
+	/* convert the 128 bit into an 32 byte ascii string */
 	for(int i = 0; i < 16; i++)
 	{
 		if(hash[i] < 0x10)
-			snprintf(hashStr+(i * 2), 32, "0%x", hash[i]);
+		{
+			/* add leading zeros to make sure every 
+			 * hash string is exactly 32 characters */
+			snprintf(hashStr + (i * 2), 32, "0%x", hash[i]);
+		}
 		else
-			snprintf(hashStr+(i * 2), 32, "%x", hash[i]);
+		{
+			snprintf(hashStr + (i * 2), 32, "%x", hash[i]);
+		}
 	}
 
 	char newName[128];
@@ -370,7 +400,9 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	res = pwrite(fileFD, hashStr, 32, 0);
 
 	if(res == -1)
+	{
 		res = -errno;
+	}
 
 	close(fileFD);
 
@@ -393,12 +425,16 @@ static int dedupUnlink(const char* path)
 	int fd = open(path, O_RDONLY);
 	
 	if (fd < 0)
+	{
 		return -errno;
+	}
 
 	int res = pread(fd, hashBuf, 32, 0);
 
 	if (res == -1)
+	{
 		res = -errno;
+	}
 
 	close(fd);
 
