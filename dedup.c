@@ -15,7 +15,7 @@
 #define FUSE_USE_VERSION 31
 #include <fuse.h>
 
-#define DWRITE(str) {write(debugFD, str, strlen(str));write(debugFD, "\n", 1);}
+typedef enum { INC, DEC } direction_e;
 
 /*
  * Adds the value of direction to the reference counter of the file
@@ -23,68 +23,60 @@
  * This is required to track how many files refer to the same
  * content.
  */
-static void updateReferenceCount(const char* hash, int32_t direction)
+static int updateReferenceCount(const char* hash, direction_e direction)
 {
-	/* open the reference counter file.
-	 * The file is organized in blocks of 36 bytes.
-	 * Each 36 Byte block is made up of
-	 * 32 Bytes of MD5 ASCII String and 4 Bytes as a raw integer
-	 */
-	FILE* file = fopen("/home/osp-user/.CONTAINER/count", "rw");
+	char path[128];
+	snprintf(path, 128, "/home/osp-user/.CONTAINER/count/%s", hash);
 
-	for (int i = 0;;) 
+	FILE* file;
+	if( access( path, F_OK ) != -1 ) 
 	{
-		/* read 36 bytes */
-		char buffer[36];
-    	size_t n = fread(buffer, 1, 36, file);
+		// exists
+		file = fopen(path, "r+");
+	} 
+	else
+	{
+		// exists not
+    	file = fopen(path, "w+");
+	}
+	printf("hash: %s\n", path);
+	if(file == NULL)
+	{
+		printf("hash: %s\n", path);
+		printf("cant open count: %s\n", strerror(errno));
 
-    	if (n < bufsize) 
-    	{ 
-    		/* exit on eof */
-    		break; 
-    	}
-    	else
-    	{
-    		/* check if we found the correct hash */
-    		if(strncmp(hash, buffer, 32) == 0)
-    		{
-    			/* Interpret the last 4 bytes as an integer */
-    			int32_t count = *(int32_t*)(buffer + 32);
-
-    			/* update the value */
-    			count += direction;
-
-    			/* Split the integer back into 4 bytes 
-    			 * (bit magic, check stackoverflow or something) */
-    			buffer[32] = (count >> 24) & 0xFF;
-				buffer[33] = (count >> 16) & 0xFF;
-				buffer[34] = (count >> 8) & 0xFF;
-				buffer[35] = count & 0xFF;
-
-				/* write the 36 byte block back */
-				fseek(file, i * 36, SEEK_SET);
-				fwrite(buffer, 1, 36, file);
-
-				close(fd);
-
-				return count;
-    		}
-
-    		i++;
-    	}
+		return 0;
 	}
 
-	/* if no entry is found, just append it at the very end */
-	fwrite(hash, 1, 32, file);
-	int32_t c = 0;
-	fwrite(&c, 1, 4, file);
+	int count;
+	size_t n = fread(&count, sizeof(int), 1, file);
 
-	close(fd);
+	// printf("n: %zu\ncount old: %d\n", n, count);
 
-	return 0;
+	if(n == 1)
+		count = (direction == INC) ? (count + 1) : (count - 1);
+	else 
+		count = 1;
+
+	// printf("count new: %d\n", count);
+
+	fseek(file, 0, SEEK_SET);
+	fwrite(&count, sizeof(int), 1, file);
+
+	fclose(file);
+
+	return count;
 }
 
-static int debugFD;
+static char* magicPath(const char* path)
+{
+	char* newPath = malloc((strlen(path) * sizeof(char)) + 23);
+
+	strcpy(newPath, "/home/osp-user/dedupFS");
+	strcat(newPath, path);
+
+	return newPath;
+}
 
 /**
  * copy the file from srcPath to a file at destPath
@@ -117,7 +109,7 @@ static int md5hash(const char* filename, unsigned char* hash)
 	MD5_Init(&ctx);
 
 	/* open the file */
-	int fd = open(filename, O_RDONLY);
+	int fd = open(filename, O_RDWR);
 
 	if(fd < 0)
 		return -errno;
@@ -142,17 +134,17 @@ static int md5hash(const char* filename, unsigned char* hash)
  */
 static int dedupMkdir(const char* path, mode_t mode)
 {
-	DWRITE("MKDIR");
-	DWRITE(path);
-	return (mkdir(path, mode) != 0) ? -errno : 0;
+	char* nPath  = magicPath(path);
+	int res = (mkdir(nPath, mode) != 0) ? -errno : 0;
+	free(nPath);
+
+	return res;
 }
 
 /**@brief Initializes the file system.
  */
 static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 {
-	DWRITE("INIT");
-
 	// enables logging via printf() into the log file
 	struct fuse_context* ctx = fuse_get_context();
 	int fd = *(int*) ctx->private_data;
@@ -165,8 +157,11 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 	cfg->attr_timeout = 0;
 	cfg->negative_timeout = 0;
 
-	DWRITE("Creating /home/osp-user/.CONTAINER");
-	mkdir("/home/osp-user/.CONTAINER", 0777);
+	mkdir("/home/osp-user/.CONTAINER/", 0777);
+
+	mkdir("/home/osp-user/.CONTAINER/count/", 0777);
+
+	mkdir("/home/osp-user/dedupFS/", 0777);
 
 	return NULL;
 }
@@ -175,7 +170,11 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
  */
 static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_info* fi)
 {
-	int rc = lstat(path, stbuf);
+	char* nPath = magicPath(path);
+
+	int rc = lstat(nPath, stbuf);
+	
+	free(nPath);
 	
 	return (rc != 0) ? -errno : 0;
 }
@@ -185,16 +184,19 @@ static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_i
 static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler, 
 	off_t offset, struct fuse_file_info* fi, enum fuse_readdir_flags flags)
 {
-	DWRITE("READDIR");
-	DWRITE(path);
+	char* newPath = magicPath(path);
+
+	printf("dedupReadDir in: %s\n", newPath);
 
 	DIR* dir;
 	struct dirent* entry;
 	
-	if ((dir = opendir(path)) == NULL)
+	if ((dir = opendir(newPath)) == NULL)
 	{
 		return -errno;
 	}
+
+	free(newPath);
 	
 	seekdir(dir, offset);
 	while ((entry = readdir(dir)) != NULL)
@@ -221,28 +223,40 @@ static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler,
  */
 static int dedupCreate(const char* path, mode_t mode, struct fuse_file_info* fi)
 {
-	DWRITE("CREATE");
-	DWRITE(path);
+	char* nPath = magicPath(path);
 
-	int fd = open(path, fi->flags, mode);
-
-	if (fd < 0)
+	if(access(nPath, F_OK) != -1) 
 	{
-		return -errno;
-	}
-	
-	close(fd);
+		errno = EEXIST;
 
-	return 0;
+		free(nPath);
+		return -EEXIST;
+	}
+	else
+	{
+		int fd = creat(nPath, mode);
+
+		if(fd < 0)
+		{
+			printf("dedupCreate: %s\n", strerror(errno));
+
+			free(nPath);
+			return -errno;
+		}
+		else
+		{ 
+			close(fd);
+
+			free(nPath);
+			return 0;
+		}
+	}
 }
 
 /**@brief Used to open files.
  */
 static int dedupOpen(const char* path, struct fuse_file_info* fi)
 {
-	DWRITE("OPEN");
-	DWRITE(path);
-
 	if(fi) 
 	{
 		if(fi->fh) 
@@ -251,19 +265,23 @@ static int dedupOpen(const char* path, struct fuse_file_info* fi)
 		}
 	}
 
-	int fd = open(path, O_CREAT | O_WRONLY, 0644);
+	char* nPath = magicPath(path);
 	
+	int fd = open(nPath, fi->flags);
+
+	printf("dedupOpen: %s\n", nPath);
+
 	if (fd < 0)
 	{
-		if(errno != EEXIST)
-		{
-			DWRITE(strerror(errno));
-			return -errno;
-		}
+		printf("dedupOpen: %s\n", strerror(errno));
+
+		free(nPath);
+		return -errno;
 	}
 
 	close(fd);
 	
+	free(nPath);
 	return 0;
 }
 
@@ -272,16 +290,16 @@ static int dedupOpen(const char* path, struct fuse_file_info* fi)
 static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
                      struct fuse_file_info* fi)
 {
-	DWRITE("READ");
-	DWRITE(path);
+	char* nPath = magicPath(path);
 
 	char hashBuf[33];
 	hashBuf[32] = 0x00;
 
-	int fd = open(path, O_RDONLY);
+	int fd = open(nPath, O_RDWR);
 	
 	if (fd < 0)
 	{
+		free(nPath);
 		return -errno;
 	}
 
@@ -297,10 +315,11 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 	char name[128];
 	snprintf(name, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 
-	fd = open(name, O_RDONLY);
+	fd = open(name, O_RDWR);
 
 	if(fd < 0)
 	{
+		free(nPath);
 		return -errno;
 	}
 
@@ -308,6 +327,7 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 
 	close(fd);
 
+	free(nPath);
 	return res;
 }
 
@@ -316,15 +336,17 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 static int dedupWrite(const char* path, const char* buf, size_t size,
                       off_t offset, struct fuse_file_info* fi)
 {
-	DWRITE("WRITE");
-	DWRITE(path);
+	char* nPath = magicPath(path);
 
 	(void) fi;
 	int res = 0;
-	int fileFD = open(path, O_RDONLY);
+	int fileFD = open(nPath, O_RDWR);
 	
+	// printf("fileFD: %d\n", fileFD);
+
 	if (fileFD < 0)
 	{
+		printf("1: %s\n", strerror(errno));
 		res = -errno;
 	}
 
@@ -334,10 +356,13 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 
 	if (res == -1)
 	{
+		printf("2: %s\n", strerror(errno));
 		res = -errno;
 	}
 
 	close(fileFD);
+
+	// printf("Reading file\n");
 
 	char* oldName = calloc(128, sizeof(char));
 
@@ -351,16 +376,17 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	{
 		snprintf(oldName, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 		copyFile(oldName, "/home/osp-user/.CONTAINER/temp");
-		updateReferenceCount(hashBuf, -1);
+		updateReferenceCount(hashBuf, DEC);
 	}
 
 	int hashFD = open("/home/osp-user/.CONTAINER/temp", O_RDWR);
 
-	res = pwrite(hashFD, buf, size, offset);
+	int resFinal = pwrite(hashFD, buf, size, offset);
 
-	if(res == -1)
+	if(resFinal == -1)
 	{
-		res = -errno;
+		printf("3: %s\n", strerror(errno));
+		resFinal = -errno;
 	}
 
 	close(hashFD);
@@ -388,12 +414,11 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 	char newName[128];
 	snprintf(newName, 128, "/home/osp-user/.CONTAINER/%s", hashStr);
 
-	DWRITE(newName);
-
-	fileFD = open(path, O_WRONLY | O_TRUNC);
+	fileFD = open(nPath, O_RDWR);
 
 	if(fileFD < 0)
 	{
+		printf("4: %s\n", strerror(errno));
 		res = -errno;
 	}
 
@@ -401,31 +426,33 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 
 	if(res == -1)
 	{
+		printf("5: %s\n", strerror(errno));
 		res = -errno;
 	}
 
 	close(fileFD);
 
 	rename("/home/osp-user/.CONTAINER/temp", newName);
-	updateReferenceCount(hashStr, 1);
+	updateReferenceCount(hashStr, INC);
 
 	free(oldName);
 
-	return res;
+	free(nPath);
+	return resFinal;
 }
 
 static int dedupUnlink(const char* path)
 {
-	DWRITE("UNLINK");
-	DWRITE(path);
-
 	char hashBuf[33];
 	hashBuf[32] = 0x00;
 
-	int fd = open(path, O_RDONLY);
+	char* nPath = magicPath(path);
+
+	int fd = open(nPath, O_RDWR);
 	
 	if (fd < 0)
 	{
+		free(nPath);
 		return -errno;
 	}
 
@@ -438,21 +465,44 @@ static int dedupUnlink(const char* path)
 
 	close(fd);
 
-	int count = updateReferenceCount(hashBuf, -1);
+	int count = updateReferenceCount(hashBuf, DEC);
+
+	if(unlink(nPath) != 0)
+	{
+		free(nPath);
+		return -errno;
+	}
 
 	if(count == 0)
 	{
-		// delete from .container
+		char path2[128];
+		snprintf(path2, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
+
+		if(unlink(path2) != 0)
+		{
+			free(nPath);
+			return -errno;
+		}
+
+		snprintf(path2, 128, "/home/osp-user/.CONTAINER/count/%s", hashBuf);
+		
+		if(unlink(path2) != 0)
+		{
+			free(nPath);
+			return -errno;
+		}
 	}
 
-	return (unlink(path) != 0) ? -errno : 0;
+	free(nPath);
+	return 0;
 }
 
 static int dedupRmdir(const char* path)
 {
-	DWRITE("RMDIR");
-	DWRITE(path);
-	return (rmdir(path) != 0) ? -errno : 0;
+	char* nPath = magicPath(path);
+	int res = (rmdir(nPath) != 0) ? -errno : 0;
+	free(nPath);
+	return res;
 }
 
 /**@brief Maps the callback functions to FUSE operations.
@@ -478,12 +528,6 @@ int main(int argc, char* argv[])
 	if ((fd = open("log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0)
 	{
 		perror("Logfile");
-		return -1;
-	}
-
-	if ((debugFD = open("error.log", O_WRONLY | O_CREAT | O_TRUNC, 0644)) < 0)
-	{
-		perror("error file");
 		return -1;
 	}
 	
