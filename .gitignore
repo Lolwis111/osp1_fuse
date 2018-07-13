@@ -1,3 +1,6 @@
 dedup
 *.zip
 *.o
+color.sh
+log.txt
+dedup_fs/
