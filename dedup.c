@@ -15,6 +15,8 @@
 
 #include "util.h"
 
+extern const char* dedupFSRoot;
+
 #define FUSE_USE_VERSION 31
 #include <fuse.h>
 
@@ -37,15 +39,15 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 	/* create some working directories for our file system */
 	printf("Creating container\n");
 	/* Here we store the data file */
-	mkdir("/home/osp-user/.CONTAINER/", 777);
+	mkdir(CONTAINER_PATH, 0777);
 
 	/* Here we store how many times each data file is referenced */
 	printf("Creating count\n");
-	mkdir("/home/osp-user/.CONTAINER/count/", 777);
+	mkdir(COUNT_PATH, 0777);
 
 	/* Here we store the files containing the hashes ('userspace files') */
 	printf("Creating dedupFS\n");
-	mkdir("/home/osp-user/dedupFS/", 777);
+	mkdir(DEDUP_PATH"/", 0777);
 
 	return NULL;
 }
@@ -224,7 +226,7 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset, str
 
 	/* build the path to the data file in the container */
 	char name[128];
-	snprintf(name, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
+	snprintf(name, 128, CONTAINER_PATH"%s", hashBuf);
 
 	fd = open(name, O_RDWR);
 
@@ -278,21 +280,21 @@ static int dedupWrite(const char* path, const char* buf, size_t size, off_t offs
 	if(res == 0)
 	{
 		/* if no data was read, we create a new temporary file */
-		strcpy(oldName, "/home/osp-user/.CONTAINER/temp");
+		strcpy(oldName, CONTAINER_PATH"temp");
 		int f = creat(oldName, 0644);
 		close(f);
 	}
 	else
 	{
 		/* if the hash was read, we copy the file with the given hash into a temporary file */
-		snprintf(oldName, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
-		copyFile(oldName, "/home/osp-user/.CONTAINER/temp");
+		snprintf(oldName, 128, CONTAINER_PATH"%s", hashBuf);
+		copyFile(oldName, CONTAINER_PATH"temp");
 
 		updateReferenceCount(hashBuf, DIR_DECREMENT);
 	}
 
 	/* write to that temporary file */
-	int hashFD = open("/home/osp-user/.CONTAINER/temp", O_RDWR);
+	int hashFD = open(CONTAINER_PATH"temp", O_RDWR);
 	int resFinal = pwrite(hashFD, buf, size, offset);
 
 	if(resFinal == -1)
@@ -305,7 +307,7 @@ static int dedupWrite(const char* path, const char* buf, size_t size, off_t offs
 	/* calculate the md5 hash of the new file */
 	unsigned char *hash = calloc(32, sizeof(unsigned char));
 
-	md5hash("/home/osp-user/.CONTAINER/temp", hash);
+	md5hash(CONTAINER_PATH"temp", hash);
 	char hashStr[33];
 	hashStr[32] = 0x00;
 
@@ -327,7 +329,7 @@ static int dedupWrite(const char* path, const char* buf, size_t size, off_t offs
 	free(hash);
 
 	char newName[128];
-	snprintf(newName, 128, "/home/osp-user/.CONTAINER/%s", hashStr);
+	snprintf(newName, 128, CONTAINER_PATH"%s", hashStr);
 
 	/* save the new hash in the user specified file */
 	fileFD = open(nPath, O_RDWR);
@@ -349,7 +351,7 @@ static int dedupWrite(const char* path, const char* buf, size_t size, off_t offs
 	close(fileFD);
 
 	/* and rename the temp file to the new hash */
-	rename("/home/osp-user/.CONTAINER/temp", newName);
+	rename(CONTAINER_PATH"temp", newName);
 	/* finally, we update the reference counter */
 	updateReferenceCount(hashStr, DIR_INCREMENT);
 
@@ -412,7 +414,7 @@ static int dedupUnlink(const char* path)
 	{
 		/* we delete it and its counter-file */
 		char path2[128];
-		snprintf(path2, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
+		snprintf(path2, 128, CONTAINER_PATH"%s", hashBuf);
 
 		if(unlink(path2) != 0)
 		{
@@ -420,7 +422,7 @@ static int dedupUnlink(const char* path)
 			return -errno;
 		}
 
-		snprintf(path2, 128, "/home/osp-user/.CONTAINER/count/%s", hashBuf);
+		snprintf(path2, 128, COUNT_PATH"%s", hashBuf);
 		
 		if(unlink(path2) != 0)
 		{

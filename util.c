@@ -18,7 +18,7 @@
 int updateReferenceCount(const char* hash, direction_e direction)
 {
 	char path[128];
-	snprintf(path, 128, "/home/osp-user/.CONTAINER/count/%s", hash);
+	snprintf(path, 128, COUNT_PATH"%s", hash);
 
 	/* open the file containing the reference count for this hash 
 	 * (and create it if it does not exist)
@@ -74,9 +74,9 @@ int updateReferenceCount(const char* hash, direction_e direction)
  */
 char* magicPath(const char* path)
 {
-	char* newPath = malloc((strlen(path) * sizeof(char)) + 23);
+	char* newPath = malloc((strlen(path) * sizeof(char)) + strlen(DEDUP_PATH) + 1);
 
-	strcpy(newPath, "/home/osp-user/dedupFS");
+	strcpy(newPath, DEDUP_PATH);
 	strcat(newPath, path);
 
 	return newPath;
