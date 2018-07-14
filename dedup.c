@@ -5,141 +5,18 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <time.h>
+
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
-#include "md5.h"
+#include "util.h"
 
 #define FUSE_USE_VERSION 31
 #include <fuse.h>
-
-typedef enum { INC, DEC } direction_e;
-
-/*
- * Adds the value of direction to the reference counter of the file
- * with the given hash.
- * This is required to track how many files refer to the same
- * content.
- */
-static int updateReferenceCount(const char* hash, direction_e direction)
-{
-	char path[128];
-	snprintf(path, 128, "/home/osp-user/.CONTAINER/count/%s", hash);
-
-	FILE* file;
-	if( access( path, F_OK ) != -1 ) 
-	{
-		// exists
-		file = fopen(path, "r+");
-	} 
-	else
-	{
-		// exists not
-    	file = fopen(path, "w+");
-	}
-	printf("hash: %s\n", path);
-	if(file == NULL)
-	{
-		printf("hash: %s\n", path);
-		printf("cant open count: %s\n", strerror(errno));
-
-		return 0;
-	}
-
-	int count;
-	size_t n = fread(&count, sizeof(int), 1, file);
-
-	// printf("n: %zu\ncount old: %d\n", n, count);
-
-	if(n == 1)
-		count = (direction == INC) ? (count + 1) : (count - 1);
-	else 
-		count = 1;
-
-	// printf("count new: %d\n", count);
-
-	fseek(file, 0, SEEK_SET);
-	fwrite(&count, sizeof(int), 1, file);
-
-	fclose(file);
-
-	return count;
-}
-
-static char* magicPath(const char* path)
-{
-	char* newPath = malloc((strlen(path) * sizeof(char)) + 23);
-
-	strcpy(newPath, "/home/osp-user/dedupFS");
-	strcat(newPath, path);
-
-	return newPath;
-}
-
-/**
- * copy the file from srcPath to a file at destPath
- */
-static void copyFile(char* srcPath, char* destPath)
-{
-	/* Let the shell handle this, much easier */
-	pid_t id;
-	if((id = fork()) == 0)
-	{
-		execl("/bin/cp", "-pf", srcPath, destPath, (char *)0);
-	}
-	{
-		waitpid(id, NULL, 0);
-	}
-}
-
-/**
- * Calculate the md5 hash in hash of the file pointed to by
- * filename (a path).
- * Check md5.h and md5.c for legal information and licence
- * and stuff.
- */
-static int md5hash(const char* filename, unsigned char* hash)
-{
-	MD5_CTX ctx;
-	char buffer[512];
-
-	/* initalize the md5 process */
-	MD5_Init(&ctx);
-
-	/* open the file */
-	int fd = open(filename, O_RDWR);
-
-	if(fd < 0)
-		return -errno;
-
-	/* md5 processes data in blocks of 512, so read 512 blocks */
-	ssize_t bytes = read(fd, buffer, 512);
-	while(bytes > 0)
-	{
-		MD5_Update(&ctx, buffer, bytes);
-		bytes = read(fd, buffer, 512);
-	}
-
-	/* finish it up */
-	MD5_Final(hash, &ctx);
-
-	close(fd);
-
-	return 0;
-}
-
- /**@brief Used to create directories.
- */
-static int dedupMkdir(const char* path, mode_t mode)
-{
-	char* nPath  = magicPath(path);
-	int res = (mkdir(nPath, mode) != 0) ? -errno : 0;
-	free(nPath);
-
-	return res;
-}
 
 /**@brief Initializes the file system.
  */
@@ -157,13 +34,35 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 	cfg->attr_timeout = 0;
 	cfg->negative_timeout = 0;
 
-	mkdir("/home/osp-user/.CONTAINER/", 0777);
+	/* create some working directories for our file system */
+	printf("Creating container\n");
+	/* Here we store the data file */
+	mkdir("/home/osp-user/.CONTAINER/", 777);
 
-	mkdir("/home/osp-user/.CONTAINER/count/", 0777);
+	/* Here we store how many times each data file is referenced */
+	printf("Creating count\n");
+	mkdir("/home/osp-user/.CONTAINER/count/", 777);
 
-	mkdir("/home/osp-user/dedupFS/", 0777);
+	/* Here we store the files containing the hashes ('userspace files') */
+	printf("Creating dedupFS\n");
+	mkdir("/home/osp-user/dedupFS/", 777);
 
 	return NULL;
+}
+
+ /**@brief Used to create directories.
+ */
+static int dedupMkdir(const char* path, mode_t mode)
+{
+	char* nPath  = magicPath(path);
+
+	printf("dedupMkdir(%s)\n", nPath);
+
+	int res = (mkdir(nPath, mode) != 0) ? -errno : 0;
+
+	free(nPath);
+
+	return res;
 }
 
 /**@brief Used to retrieve file attributes.
@@ -171,6 +70,8 @@ static void* dedupInit(struct fuse_conn_info* conn, struct fuse_config* cfg)
 static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_info* fi)
 {
 	char* nPath = magicPath(path);
+
+	printf("dedupGetAttr(%s)\n", nPath);
 
 	int rc = lstat(nPath, stbuf);
 	
@@ -181,12 +82,11 @@ static int dedupGetAttr(const char* path, struct stat* stbuf, struct fuse_file_i
 
 /**@brief Used to retrieve directory entries.
  */
-static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler, 
-	off_t offset, struct fuse_file_info* fi, enum fuse_readdir_flags flags)
+static int dedupReadDir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi, enum fuse_readdir_flags flags)
 {
 	char* newPath = magicPath(path);
 
-	printf("dedupReadDir in: %s\n", newPath);
+	printf("dedupReadDir(%s)\n", newPath);
 
 	DIR* dir;
 	struct dirent* entry;
@@ -225,21 +125,24 @@ static int dedupCreate(const char* path, mode_t mode, struct fuse_file_info* fi)
 {
 	char* nPath = magicPath(path);
 
+	printf("dedupCreate(%s)\n", nPath);
+
+	/* check if the file exists already */
 	if(access(nPath, F_OK) != -1) 
 	{
 		errno = EEXIST;
 
+		/* return an error if yes */
 		free(nPath);
 		return -EEXIST;
 	}
 	else
 	{
+		/* else, create the file */
 		int fd = creat(nPath, mode);
 
 		if(fd < 0)
 		{
-			printf("dedupCreate: %s\n", strerror(errno));
-
 			free(nPath);
 			return -errno;
 		}
@@ -267,34 +170,33 @@ static int dedupOpen(const char* path, struct fuse_file_info* fi)
 
 	char* nPath = magicPath(path);
 	
-	int fd = open(nPath, fi->flags);
+	printf("dedupOpen(%s)\n", nPath);
 
-	printf("dedupOpen: %s\n", nPath);
+	int fd = open(nPath, fi->flags);
 
 	if (fd < 0)
 	{
-		printf("dedupOpen: %s\n", strerror(errno));
-
 		free(nPath);
 		return -errno;
 	}
 
 	close(fd);
-	
 	free(nPath);
 	return 0;
 }
 
 /**@brief Used to read file contents.
  */
-static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
-                     struct fuse_file_info* fi)
+static int dedupRead(const char* path, char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
 	char* nPath = magicPath(path);
+
+	printf("dedupRead(%s)\n", nPath);
 
 	char hashBuf[33];
 	hashBuf[32] = 0x00;
 
+	/* Read the hash from the userspace file. */
 	int fd = open(nPath, O_RDWR);
 	
 	if (fd < 0)
@@ -312,6 +214,15 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 
 	close(fd);
 
+	/* if there was no hash read, we just return 0 
+	 * to indicate that no data was read */
+	if(res == 0)
+	{
+		free(nPath);
+		return 0;
+	}
+
+	/* build the path to the data file in the container */
 	char name[128];
 	snprintf(name, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 
@@ -323,6 +234,7 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 		return -errno;
 	}
 
+	/* and read the real data */
 	res = pread(fd, buf, size, offset);
 
 	close(fd);
@@ -333,65 +245,66 @@ static int dedupRead(const char* path, char* buf, size_t size, off_t offset,
 
 /**@brief Used to write file contents.
  */
-static int dedupWrite(const char* path, const char* buf, size_t size,
-                      off_t offset, struct fuse_file_info* fi)
+static int dedupWrite(const char* path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
 	char* nPath = magicPath(path);
+
+	printf("dedupWrite(%s)\n", nPath);
 
 	(void) fi;
 	int res = 0;
 	int fileFD = open(nPath, O_RDWR);
 	
-	// printf("fileFD: %d\n", fileFD);
-
+	/* open the file the user specified */
 	if (fileFD < 0)
 	{
-		printf("1: %s\n", strerror(errno));
 		res = -errno;
 	}
 
+	/* and read the hash in there */
 	char hashBuf[33];
 	hashBuf[32] = 0x00;
 	res = pread(fileFD, hashBuf, 32, 0);
 
 	if (res == -1)
 	{
-		printf("2: %s\n", strerror(errno));
 		res = -errno;
 	}
 
 	close(fileFD);
 
-	// printf("Reading file\n");
-
 	char* oldName = calloc(128, sizeof(char));
 
 	if(res == 0)
 	{
+		/* if no data was read, we create a new temporary file */
 		strcpy(oldName, "/home/osp-user/.CONTAINER/temp");
 		int f = creat(oldName, 0644);
 		close(f);
 	}
 	else
 	{
+		/* if the hash was read, we copy the file with the given hash into a temporary file */
 		snprintf(oldName, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 		copyFile(oldName, "/home/osp-user/.CONTAINER/temp");
-		updateReferenceCount(hashBuf, DEC);
+
+		updateReferenceCount(hashBuf, DIR_DECREMENT);
 	}
 
+	/* write to that temporary file */
 	int hashFD = open("/home/osp-user/.CONTAINER/temp", O_RDWR);
-
 	int resFinal = pwrite(hashFD, buf, size, offset);
 
 	if(resFinal == -1)
 	{
-		printf("3: %s\n", strerror(errno));
 		resFinal = -errno;
 	}
 
 	close(hashFD);
 
+	/* calculate the md5 hash of the new file */
 	unsigned char *hash = calloc(32, sizeof(unsigned char));
+
 	md5hash("/home/osp-user/.CONTAINER/temp", hash);
 	char hashStr[33];
 	hashStr[32] = 0x00;
@@ -411,9 +324,12 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 		}
 	}
 
+	free(hash);
+
 	char newName[128];
 	snprintf(newName, 128, "/home/osp-user/.CONTAINER/%s", hashStr);
 
+	/* save the new hash in the user specified file */
 	fileFD = open(nPath, O_RDWR);
 
 	if(fileFD < 0)
@@ -432,15 +348,20 @@ static int dedupWrite(const char* path, const char* buf, size_t size,
 
 	close(fileFD);
 
+	/* and rename the temp file to the new hash */
 	rename("/home/osp-user/.CONTAINER/temp", newName);
-	updateReferenceCount(hashStr, INC);
+	/* finally, we update the reference counter */
+	updateReferenceCount(hashStr, DIR_INCREMENT);
 
 	free(oldName);
-
 	free(nPath);
 	return resFinal;
 }
 
+/**
+ * Removes a file from the userspace and also removes 
+ * the data in the container, if possible.
+ */
 static int dedupUnlink(const char* path)
 {
 	char hashBuf[33];
@@ -448,6 +369,9 @@ static int dedupUnlink(const char* path)
 
 	char* nPath = magicPath(path);
 
+	printf("dedupUnlink(%s)\n", nPath);
+
+	/* load the hash from the userspace file */
 	int fd = open(nPath, O_RDWR);
 	
 	if (fd < 0)
@@ -465,16 +389,28 @@ static int dedupUnlink(const char* path)
 
 	close(fd);
 
-	int count = updateReferenceCount(hashBuf, DEC);
-
+	/* delete the userspace file */
 	if(unlink(nPath) != 0)
 	{
 		free(nPath);
 		return -errno;
 	}
 
+	/* if no hash was read because the file was empty we 
+	 * dont have to delete anything from the container */
+	if(res == 0)
+	{
+		free(nPath);
+		return 0;
+	}
+
+	/* update the reference counter */
+	int count = updateReferenceCount(hashBuf, DIR_DECREMENT);
+
+	/* if no more files reference this hash(file) */
 	if(count == 0)
 	{
+		/* we delete it and its counter-file */
 		char path2[128];
 		snprintf(path2, 128, "/home/osp-user/.CONTAINER/%s", hashBuf);
 
@@ -497,11 +433,70 @@ static int dedupUnlink(const char* path)
 	return 0;
 }
 
+/**
+ * @brief Deletes a directory and its contents.
+ */
 static int dedupRmdir(const char* path)
 {
 	char* nPath = magicPath(path);
+
+	printf("dedupRmdir(%s)\n", nPath);
+
 	int res = (rmdir(nPath) != 0) ? -errno : 0;
+
 	free(nPath);
+
+	return res;
+}
+
+/**
+ * @brief Change the last access time of the file.
+ */
+static int dedupUtimens(const char* path, const struct timespec tv[2], struct fuse_file_info* fi)
+{
+	(void)fi;
+	char* nPath = magicPath(path);
+
+	printf("dedupUtimens(%s)\n", nPath);
+
+	int res = (utimensat(AT_FDCWD, nPath, tv, 0) == 0) ? 0 : -errno;
+
+	free(nPath);
+
+	return res;
+}
+
+/**
+ * @brief Change the owner of the file.
+ */
+static int dedupChown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info* fi)
+{
+	(void)fi;
+	char* nPath = magicPath(path);
+	
+	printf("dedupChown(%s)\n", nPath);
+
+	int res = (chown(nPath, uid, gid) == 0) ? 0 : -errno;
+
+	free(nPath);
+
+	return res;
+}
+
+/**
+ * @brief Change the mode bits of the file.
+ */
+static int dedupChmod(const char* path, mode_t mode, struct fuse_file_info* fi)
+{
+	(void)fi;
+	char* nPath = magicPath(path);
+
+	printf("dedupChmod(%s)\n", nPath);
+
+	int res = (chmod(nPath, mode) == 0) ? 0 : -errno;
+
+	free(nPath);
+
 	return res;
 }
 
@@ -518,6 +513,9 @@ static const struct fuse_operations dedupOper = {
 	.write          = dedupWrite,
 	.unlink			= dedupUnlink,
 	.rmdir 			= dedupRmdir,
+	.utimens		= dedupUtimens,
+	.chown 			= dedupChown,
+	.chmod 			= dedupChmod
 };
 
 int main(int argc, char* argv[])
